@@ -50,7 +50,7 @@ from relax.utils.data.stream_dataloader import (
     post_process_rollout_data,
 )
 from relax.utils.distributed_utils import get_gloo_group
-from relax.utils.memory_utils import clear_memory, print_memory
+from relax.utils.memory_utils import clear_memory, print_memory, set_memory_logging
 from relax.utils.metrics.metric_utils import compute_rollout_step
 from relax.utils.opd.opd_utils import (
     append_managed_opd_teacher_offload_handle,
@@ -139,6 +139,7 @@ class MegatronTrainRayActor(TrainRayActor):
         self.genrm_manager = None
 
         init(args)
+        set_memory_logging(getattr(args, "log_memory_usage", True))
         if repatch is not None:
             repatch(args)
         tq.init(args.tq_config)

@@ -12,6 +12,22 @@ from relax.utils.logging_utils import get_logger
 logger = get_logger(__name__)
 
 
+# Per-step memory-usage debug prints on the colocate model-switch path
+# (sleep / wake_up / update_weights) each issue a CUDA mem query + an all-rank
+# log line, and some also force synchronize()+empty_cache() via
+# ``clear_before_print``. That is pure observability overhead sitting on the
+# switch critical path (~10-13% of step time in colocate multimodal). Gate it so
+# throughput-sensitive runs can turn it off. Default True preserves the existing
+# behavior; flip via ``--no-log-memory-usage``.
+_LOG_MEMORY_USAGE = True
+
+
+def set_memory_logging(enabled: bool) -> None:
+    """Enable/disable ``print_memory`` (debug observability on the switch path)."""
+    global _LOG_MEMORY_USAGE
+    _LOG_MEMORY_USAGE = enabled
+
+
 def clear_memory(clear_host_memory: bool = False):
     device_utils.synchronize()
     gc.collect()
@@ -41,6 +57,9 @@ def _byte_to_gb(n: int):
 
 
 def print_memory(msg, clear_before_print: bool = False):
+    if not _LOG_MEMORY_USAGE:
+        return None
+
     if clear_before_print:
         clear_memory()
 

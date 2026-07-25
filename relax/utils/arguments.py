@@ -1909,6 +1909,17 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
             )
             parser.add_argument("--check-weight-update-equal", action="store_true")
             parser.add_argument(
+                "--log-memory-usage",
+                action=argparse.BooleanOptionalAction,
+                default=True,
+                help=(
+                    "Log per-phase GPU memory usage via print_memory(). Default True keeps the "
+                    "existing behavior. Pass --no-log-memory-usage to skip these debug prints "
+                    "(and their clear_before_print synchronize()+empty_cache()) on the colocate "
+                    "model-switch path (sleep/wake_up/update_weights) in throughput-sensitive runs."
+                ),
+            )
+            parser.add_argument(
                 "--enable-cuda-memory-check",
                 action="store_true",
                 default=False,
