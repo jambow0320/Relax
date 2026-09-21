@@ -201,17 +201,17 @@ def _gdn_config(**overrides):
     return TransformerConfig(**kwargs)
 
 
-def test_config_default_mode_is_headwise():
+def test_config_default_mode_is_chunkwise():
     """Upgrading the image must not silently reroute an existing recipe."""
-    assert _gdn_config().linear_cp_mode == "headwise"
+    assert _gdn_config().linear_cp_mode == "chunkwise"
 
 
 def test_headwise_config_requires_heads_divisible_by_tp_times_cp():
     # 16 key heads, tp=2, cp=4 -> 16 % 8 == 0: fine.
-    _gdn_config(tensor_model_parallel_size=2, context_parallel_size=4)
+    _gdn_config(tensor_model_parallel_size=2, context_parallel_size=4, linear_cp_mode="headwise")
     # tp=2, cp=16 -> 16 % 32 != 0: the geometry headwise cannot express.
     with pytest.raises(AssertionError, match="linear_num_key_heads"):
-        _gdn_config(tensor_model_parallel_size=2, context_parallel_size=16)
+        _gdn_config(tensor_model_parallel_size=2, context_parallel_size=16, linear_cp_mode="headwise")
 
 
 def test_chunkwise_config_only_requires_heads_divisible_by_tp():

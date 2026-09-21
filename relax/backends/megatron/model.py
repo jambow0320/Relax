@@ -415,7 +415,8 @@ def setup_model_and_optimizer(
         _patch_gdn_for_dynamic_cp()
         model_config = get_model_config(model[0])
         if getattr(model_config, "experimental_attention_variant", None) == "gated_delta_net" and (
-            not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0
+            not torch.distributed.is_initialized()
+            or torch.distributed.get_rank(group=torch.distributed.group.WORLD) == 0
         ):
             logger.info(
                 f"[GDN CP] role={role} linear_cp_mode={model_config.linear_cp_mode} "
@@ -441,19 +442,24 @@ def setup_model_and_optimizer(
     return model, optimizer, opt_param_scheduler
 
 
-def _resolve_gdn_cp(self, packed_seq_params):
+def _resolve_gdn_cp(self, packed_seq_params, pg_collection=None):
     """Resolve (cp_size, cp_group, cp_rank) for a GDN forward.
 
     Prefers the per-micro-batch dynamic CP group carried on
     ``packed_seq_params`` (set in ``data.py``); falls back to the module's
     static CP group.
     """
-    if packed_seq_params is not None and getattr(packed_seq_params, "local_cp_size", None) is not None:
-        cp_group = packed_seq_params.cp_group
-        cp_size = packed_seq_params.local_cp_size
-    else:
-        cp_group = self.pg_collection.cp
-        cp_size = cp_group.size()
+    cp_group = pg_collection.cp if pg_collection is not None else self.pg_collection.cp
+    if packed_seq_params is not None:
+        dynamic_group = getattr(packed_seq_params, "cp_group", None)
+        local_cp_size = getattr(packed_seq_params, "local_cp_size", None)
+        if (dynamic_group is None) != (local_cp_size is None):
+            raise ValueError("PackedSeqParams.cp_group and local_cp_size must both be set or both be None.")
+        if dynamic_group is not None:
+            if local_cp_size != dynamic_group.size():
+                raise ValueError("PackedSeqParams.local_cp_size does not match cp_group.size().")
+            cp_group = dynamic_group
+    cp_size = cp_group.size() if cp_group is not None else 1
     cp_rank = cp_group.rank() if cp_size > 1 else 0
     return cp_size, cp_group, cp_rank
 
@@ -463,9 +469,9 @@ def _assert_gdn_full_recompute() -> None:
 
     The all-gather path below runs the recurrent scan on the *full* sequence
     duplicated on every CP rank, so the GDN activation scales with the full
-    context length. Only ``--recompute-granularity full`` (whole-layer
-    checkpointing) keeps that a per-layer transient; ``selective`` does not
-    cover GDN (its module list has no gdn/mamba entry) and silently OOMs.
+    context length. ``--recompute-granularity full`` (whole-layer checkpointing)
+    keeps that a per-layer transient. The fallback bypasses native GDN forward,
+    including its selective recompute wrapper.
 
     Only relevant to training forwards that build a graph (and thus retain
     activations): skipped when grad is disabled (weight-only / inference roles
@@ -478,11 +484,11 @@ def _assert_gdn_full_recompute() -> None:
     args = get_args()
     if getattr(args, "recompute_granularity", None) != "full":
         raise ValueError(
-            "GatedDeltaNet context-parallel (cp>1) requires whole-layer activation recompute: "
+            "GatedDeltaNet all_gather context-parallel (cp>1) requires whole-layer activation recompute: "
             "pass `--recompute-granularity full --recompute-method uniform --recompute-num-layers 1`. "
             f"Got recompute_granularity={getattr(args, 'recompute_granularity', None)!r}. "
-            "`selective` recompute does not cover GDN and will OOM (its full-sequence duplicated scan "
-            "activation stays resident)."
+            "The Relax all_gather fallback bypasses native GDN selective recompute; "
+            "its full-sequence duplicated scan activation would stay resident."
         )
     _assert_gdn_full_recompute._checked = True
 
@@ -522,7 +528,7 @@ def _patch_gdn_for_dynamic_cp() -> None:
 
         from .cp_utils import gdn_cp_slice
 
-        cp_size, cp_group, cp_rank = _resolve_gdn_cp(self, packed_seq_params)
+        cp_size, cp_group, cp_rank = _resolve_gdn_cp(self, packed_seq_params, kwargs.get("pg_collection"))
         if cp_size == 1 or self.config.linear_cp_mode != "all_gather":
             return _orig_forward(
                 self, hidden_states, attention_mask, inference_context, packed_seq_params, *args, **kwargs
@@ -545,14 +551,19 @@ def _patch_gdn_for_dynamic_cp() -> None:
         )
         _assert_gdn_full_recompute()
 
-        cu_seqlens = packed_seq_params.cu_seqlens_q
+        cu_seqlens, _ = self._resolve_thd_cu_seqlens(
+            packed_seq_params, hidden_states.shape[0] * self.sp_size * cp_size, cp_size
+        )
         # Precompute the host-side boundary list once per micro-batch (cached on the
         # shared packed_seq_params object) so the gather/slice below don't force a
         # per-GDN-layer .tolist() device sync — repeated under full recompute.
-        cu_seqlens_cpu = getattr(packed_seq_params, "_gdn_cu_seqlens_cpu", None)
-        if cu_seqlens_cpu is None:
+        cached = getattr(packed_seq_params, "_gdn_cu_seqlens_cpu", None)
+        version = None if cu_seqlens.is_inference() else cu_seqlens._version
+        if cached is not None and version is not None and cached[0] is cu_seqlens and cached[1] == version:
+            cu_seqlens_cpu = cached[2]
+        else:
             cu_seqlens_cpu = cu_seqlens.tolist()
-            packed_seq_params._gdn_cu_seqlens_cpu = cu_seqlens_cpu
+            packed_seq_params._gdn_cu_seqlens_cpu = (cu_seqlens, version, cu_seqlens_cpu)
         _, batch, _ = hidden_states.shape
 
         # Input projection on the CP-sharded (and SP-sharded) sequence.
