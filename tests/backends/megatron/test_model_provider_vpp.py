@@ -49,6 +49,7 @@ def _install_fake_megatron(monkeypatch, provider=None):
 
     megatron = types.ModuleType("megatron")
     core = types.ModuleType("megatron.core")
+    optimizer = types.ModuleType("megatron.core.optimizer")
     mpu = types.ModuleType("megatron.core.mpu")
     tensor_parallel = types.ModuleType("megatron.core.tensor_parallel")
     models = types.ModuleType("megatron.core.models")
@@ -59,6 +60,8 @@ def _install_fake_megatron(monkeypatch, provider=None):
     transformer_config = types.ModuleType("megatron.core.transformer.transformer_config")
     training = types.ModuleType("megatron.training")
     arguments = types.ModuleType("megatron.training.arguments")
+    tokenizer_package = types.ModuleType("megatron.training.tokenizer")
+    tokenizer = types.ModuleType("megatron.training.tokenizer.tokenizer")
     bridge = types.ModuleType("megatron.bridge")
     misc = types.ModuleType("relax.utils.misc")
 
@@ -76,6 +79,9 @@ def _install_fake_megatron(monkeypatch, provider=None):
         def to_megatron_provider(self, load_weights=False):
             return provider
 
+    def _unexpected_training_setup(*args, **kwargs):
+        raise AssertionError("VPP provider tests must not invoke Megatron training setup")
+
     mpu.get_virtual_pipeline_model_parallel_world_size = lambda: 2
     mpu.get_virtual_pipeline_model_parallel_rank = lambda: 1
     mpu.get_context_parallel_world_size = lambda: 1
@@ -83,6 +89,7 @@ def _install_fake_megatron(monkeypatch, provider=None):
     mpu.get_tensor_model_parallel_rank = lambda: 0
     core.mpu = mpu
     core.tensor_parallel = tensor_parallel
+    optimizer.OptimizerConfig = SimpleNamespace
     gpt.GPTModel = _FakeGPTModel
     gpt_layer_specs.get_gpt_decoder_block_spec = lambda *args, **kwargs: object()
     gpt_layer_specs.get_gpt_layer_local_spec = lambda *args, **kwargs: object()
@@ -90,12 +97,16 @@ def _install_fake_megatron(monkeypatch, provider=None):
     spec_utils.import_module = lambda path: object()
     transformer_config.TransformerConfig = _FakeTransformerConfig
     arguments.core_transformer_config_from_args = lambda args: _FakeTransformerConfig()
+    arguments.parse_args = _unexpected_training_setup
+    arguments.validate_args = _unexpected_training_setup
+    tokenizer._vocab_size_with_padding = _unexpected_training_setup
     bridge.AutoBridge = _FakeAutoBridge
     misc.load_function = lambda path: None
 
     modules = {
         "megatron": megatron,
         "megatron.core": core,
+        "megatron.core.optimizer": optimizer,
         "megatron.core.mpu": mpu,
         "megatron.core.tensor_parallel": tensor_parallel,
         "megatron.core.models": models,
@@ -106,6 +117,8 @@ def _install_fake_megatron(monkeypatch, provider=None):
         "megatron.core.transformer.transformer_config": transformer_config,
         "megatron.training": training,
         "megatron.training.arguments": arguments,
+        "megatron.training.tokenizer": tokenizer_package,
+        "megatron.training.tokenizer.tokenizer": tokenizer,
         "megatron.bridge": bridge,
         "relax.utils.misc": misc,
     }
@@ -117,7 +130,15 @@ def _install_fake_megatron(monkeypatch, provider=None):
 
 def _load_model_provider(monkeypatch, provider=None):
     provider = _install_fake_megatron(monkeypatch, provider=provider)
-    sys.modules.pop("relax.backends.megatron.model_provider", None)
+    package = importlib.import_module("relax.backends.megatron")
+    # Both real modules bind fake dependencies. Restore their cache entries and
+    # package attributes after the test, including when initially absent.
+    for name in ("arguments", "model_provider"):
+        fullname = f"{package.__name__}.{name}"
+        monkeypatch.setitem(sys.modules, fullname, None)
+        monkeypatch.delitem(sys.modules, fullname)
+        monkeypatch.setattr(package, name, None, raising=False)
+        monkeypatch.delattr(package, name)
     module = importlib.import_module("relax.backends.megatron.model_provider")
     monkeypatch.setattr(module.dist, "is_initialized", lambda: True)
     monkeypatch.setattr(module.dist, "get_rank", lambda: 1)

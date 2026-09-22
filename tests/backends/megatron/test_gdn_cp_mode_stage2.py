@@ -29,8 +29,6 @@ pytest.importorskip("megatron.core.context_parallel_layout", reason="requires th
 from megatron.core.packed_seq_params import PackedSeqParams  # noqa: E402
 from megatron.core.ssm.gated_delta_net import GatedDeltaNet  # noqa: E402
 
-from relax.backends.megatron.gdn_cp_config import _validate_linear_cp_mode  # noqa: E402
-
 
 def _load_relax_functions(filename, names):
     """Execute the real functions without importing the Ray/optimizer stack."""
@@ -49,9 +47,11 @@ def _load_relax_functions(filename, names):
     return module
 
 
+megatron_arguments = _load_relax_functions("arguments.py", ["_validate_linear_cp_mode"])
 gdn_model = _load_relax_functions(
     "model.py", ["_patch_gdn_for_dynamic_cp", "_resolve_gdn_cp", "_assert_gdn_full_recompute"]
 )
+_validate_linear_cp_mode = megatron_arguments._validate_linear_cp_mode
 
 
 # ---------------------------------------------------------------------------

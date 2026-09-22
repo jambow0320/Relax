@@ -48,8 +48,8 @@ from relax.utils.training.ppo_utils import (
     install_sequence_classification_head_in_provider,
 )
 
+from .arguments import _validate_linear_cp_mode
 from .conditional_branch_sync import install_conditional_branch_sync
-from .gdn_cp_config import _validate_linear_cp_mode
 
 
 logger = get_logger(__name__)
