@@ -1,22 +1,17 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
-"""CPU-only tests for the Task 32 Stage 2 Relax-side GDN CP routing.
+"""CPU tests for GDN CP configuration and runtime dispatch.
 
-Covers the pieces added on top of the Stage 1 FLA/MCore backport
-(``test_gdn_chunkwise_cp_layout.py``): the ``--linear-cp-mode`` CLI, invalid
-Chunkwise combinations, and the thin runtime dispatcher installed on
-``GatedDeltaNet.forward``.
-
-The dispatcher tests drive ``GatedDeltaNet.forward`` through duck-typed fakes
-and hook/counter spies instead of a real distributed process group or FLA
-kernel call, per task32-stage2-handoff.md §6.2 ("use hooks/counters, don't
-infer routing from numerics"). Real-kernel / real-collective coverage stays in
-``test_gdn_chunkwise_cp_gpu.py``.
+Covers the CLI, construction-time mode constraints, packing validation, dynamic
+CP group selection, and Relax's all-gather fallback guards. Uses fakes and
+spies for dispatch; real layout communication is covered in
+``test_gdn_cp_layout_gpu.py``.
 """
 
 from __future__ import annotations
 
 import argparse
 import ast
+import inspect
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
 
@@ -26,7 +21,7 @@ import torch
 
 pytest.importorskip("megatron.core.context_parallel_layout", reason="requires the patched Megatron-LM")
 
-from megatron.core.packed_seq_params import PackedSeqParams  # noqa: E402
+from megatron.core.packed_seq_params import PackedSeqParams, resolve_cp_group  # noqa: E402
 from megatron.core.ssm.gated_delta_net import GatedDeltaNet  # noqa: E402
 
 
@@ -55,7 +50,7 @@ _validate_linear_cp_mode = megatron_arguments._validate_linear_cp_mode
 
 
 # ---------------------------------------------------------------------------
-# Step 1: CLI flag
+# CLI flag
 # ---------------------------------------------------------------------------
 def _parse_megatron_args(monkeypatch, *argv):
     pytest.importorskip("triton", reason="the full Megatron training CLI imports Triton kernels")
@@ -79,7 +74,7 @@ def test_linear_cp_mode_flag_accepts_all_concrete_modes(monkeypatch, mode):
 
 
 # ---------------------------------------------------------------------------
-# Step 2: argument validation
+# Argument validation
 # ---------------------------------------------------------------------------
 def _args(**overrides):
     base = dict(
@@ -112,7 +107,7 @@ def test_validate_linear_cp_mode_rejects_chunkwise_deterministic_when_cp_may_exc
 
 
 # ---------------------------------------------------------------------------
-# Steps 4-6: runtime dispatcher
+# Runtime dispatcher
 # ---------------------------------------------------------------------------
 class _FakeGroup:
     """Minimal process-group stand-in exposing only .size()/.rank(): the
@@ -152,7 +147,7 @@ def _fake_gdn_module(*, linear_cp_mode, static_cp_size=1, deterministic_mode=Fal
 def _isolate_gdn_forward_patch():
     """`_patch_gdn_for_dynamic_cp` idempotently monkey-patches the *shared*
     GatedDeltaNet class attribute; save/restore it around every test so it
-    cannot leak into test_gdn_chunkwise_cp_gpu.py."""
+    cannot leak into test_gdn_cp_layout_gpu.py."""
     orig_forward = GatedDeltaNet.forward
     orig_patched_flag = getattr(GatedDeltaNet, "_dcp_patched", False)
     yield
@@ -300,3 +295,97 @@ def test_all_gather_still_requires_full_recompute(monkeypatch):
         gdn_model._assert_gdn_full_recompute()
     with torch.no_grad():
         gdn_model._assert_gdn_full_recompute()
+
+
+# ---------------------------------------------------------------------------
+# Dynamic CP group resolution
+# ---------------------------------------------------------------------------
+def test_resolve_cp_group_prefers_packed_seq_params():
+    static = object()
+    dynamic = object()
+    assert resolve_cp_group(static, None) is static
+    assert resolve_cp_group(static, PackedSeqParams(qkv_format="thd")) is static
+    assert resolve_cp_group(static, PackedSeqParams(qkv_format="thd", cp_group=dynamic)) is dynamic
+
+
+# ---------------------------------------------------------------------------
+# Construction-time capability gate
+# ---------------------------------------------------------------------------
+def _gdn_config(**overrides):
+    import torch.nn.functional as F
+    from megatron.core.transformer.transformer_config import TransformerConfig
+
+    kwargs = dict(
+        hidden_size=2048,
+        num_layers=1,
+        num_attention_heads=16,
+        num_query_groups=2,
+        normalization="RMSNorm",
+        use_cpu_initialization=True,
+        activation_func=F.silu,
+        bf16=True,
+        experimental_attention_variant="gated_delta_net",
+        linear_attention_freq=[1],
+        linear_conv_kernel_dim=4,
+        linear_key_head_dim=128,
+        linear_value_head_dim=128,
+        linear_num_key_heads=16,
+        linear_num_value_heads=32,
+    )
+    kwargs.update(overrides)
+    return TransformerConfig(**kwargs)
+
+
+def test_config_default_mode_is_chunkwise():
+    """Upgrading the image must not silently reroute an existing recipe."""
+    assert _gdn_config().linear_cp_mode == "chunkwise"
+
+
+def test_headwise_config_requires_heads_divisible_by_tp_times_cp():
+    # 16 key heads, tp=2, cp=4 -> 16 % 8 == 0: fine.
+    _gdn_config(tensor_model_parallel_size=2, context_parallel_size=4, linear_cp_mode="headwise")
+    # tp=2, cp=16 -> 16 % 32 != 0: the geometry headwise cannot express.
+    with pytest.raises(AssertionError, match="linear_num_key_heads"):
+        _gdn_config(tensor_model_parallel_size=2, context_parallel_size=16, linear_cp_mode="headwise")
+
+
+def test_chunkwise_config_only_requires_heads_divisible_by_tp():
+    """This is what replaces Relax's temporary head-count rewrite hack."""
+    cfg = _gdn_config(tensor_model_parallel_size=2, context_parallel_size=16, linear_cp_mode="chunkwise")
+    assert cfg.linear_num_key_heads == 16 and cfg.linear_num_value_heads == 32
+    # ... but TP divisibility is still enforced: GDN weights stay TP-sharded.
+    with pytest.raises(AssertionError, match="linear_num_key_heads"):
+        _gdn_config(
+            tensor_model_parallel_size=8,
+            context_parallel_size=2,
+            linear_cp_mode="chunkwise",
+            num_query_groups=8,
+            linear_num_key_heads=4,
+            linear_num_value_heads=8,
+        )
+
+
+def test_all_gather_config_uses_the_tp_only_head_rule():
+    """`--linear-cp-mode=all_gather` must be constructible on a non-divisible
+    geometry.
+
+    Relax's all-gather fallback keeps GDN weights TP-only, so declaring it
+    should relax the head check exactly as chunkwise does.
+    """
+    cfg = _gdn_config(tensor_model_parallel_size=2, context_parallel_size=16, linear_cp_mode="all_gather")
+    assert cfg.linear_num_key_heads == 16 and cfg.linear_num_value_heads == 32
+
+
+def test_config_rejects_unresolved_and_unknown_linear_cp_mode():
+    """MCore only accepts the three concrete execution modes."""
+    for bad in ("auto", "allgather", "chunk", ""):
+        with pytest.raises(AssertionError, match="linear_cp_mode"):
+            _gdn_config(context_parallel_size=2, linear_cp_mode=bad)
+        with pytest.raises(AssertionError, match="linear_cp_mode"):
+            _gdn_config(context_parallel_size=4, tensor_model_parallel_size=2, linear_cp_mode=bad)
+
+
+def test_gdn_forward_has_no_per_call_mode_override():
+    from megatron.core.ssm.gated_delta_net import GatedDeltaNet
+
+    assert "linear_cp_mode" not in inspect.signature(GatedDeltaNet.forward).parameters

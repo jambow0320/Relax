@@ -1,21 +1,9 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
-"""Unit tests for the prebuilt THD CP layout route (Task 32, phase 3).
+"""CPU tests for GDN CP partitions, layout routes, and boundary caches.
 
-Phase 1 derived the zigzag<->contiguous all-to-all plan inside every conversion,
-from device tensors, which cost a device-host synchronisation per CP rank per
-call. Phase 3 backports NVIDIA/Megatron-LM#5664's idea instead: derive the plan
-once per micro-batch on CPU and hand the same route to every GDN layer.
-
-Two things therefore need proving on CPU, with no process group:
-
-1. the segment-based route describes *exactly* the permutation the phase-1
-   index-based partition described -- otherwise chunkwise CP silently reorders
-   tokens;
-2. a cached route is only ever reused for the micro-batch, CP geometry and
-   direction it was built for.
-
-The real all-to-all round trip over NCCL stays in
-``test_gdn_chunkwise_cp_gpu.py``.
+Checks token ownership, agreement with Relax's sharding, route equivalence, and
+cache reuse/invalidation. Real NCCL layout communication is covered in
+``test_gdn_cp_layout_gpu.py``.
 """
 
 from __future__ import annotations
@@ -27,6 +15,8 @@ import torch
 cpl = pytest.importorskip("megatron.core.context_parallel_layout", reason="requires the patched Megatron-LM")
 
 from megatron.core.packed_seq_params import PackedSeqParams  # noqa: E402
+
+from relax.backends.megatron.cp_utils import gdn_cp_slice, slice_with_cp  # noqa: E402
 
 
 DIRECTIONS = [("zigzag", "contiguous"), ("contiguous", "zigzag")]
@@ -41,11 +31,137 @@ LENGTH_CASES = [
 ]
 
 
-def _cu(lengths: list[int], unit: int) -> torch.Tensor:
+def _cu(lengths: list[int], unit: int = 1) -> torch.Tensor:
     cu = [0]
     for n in lengths:
         cu.append(cu[-1] + n * unit)
     return torch.tensor(cu, dtype=torch.int64)
+
+
+def _tagged_tokens(total: int, width: int = 3) -> torch.Tensor:
+    """[total, width] where row t is (t, t+1e6, t+2e6): token identity is
+    unambiguous."""
+    base = torch.arange(total, dtype=torch.float64).unsqueeze(1)
+    return base + torch.arange(width, dtype=torch.float64).unsqueeze(0) * 1e6
+
+
+# ---------------------------------------------------------------------------
+# Partition definitions
+# ---------------------------------------------------------------------------
+@pytest.mark.parametrize("cp_size", [1, 2, 4, 8])
+@pytest.mark.parametrize("layout", ["zigzag", "contiguous"])
+@pytest.mark.parametrize("lengths_factor", [[1], [1, 2, 3], [3, 1, 1, 2]])
+def test_thd_rank_indices_partition_all_tokens_exactly_once(cp_size, layout, lengths_factor):
+    lengths = [2 * cp_size * f for f in lengths_factor]
+    cu = _cu(lengths)
+    owned = torch.cat([cpl.get_thd_context_parallel_rank_indices(cu, cp_size, r, layout) for r in range(cp_size)])
+    assert owned.numel() == int(cu[-1])
+    assert torch.equal(torch.sort(owned).values, torch.arange(int(cu[-1])))
+
+
+@pytest.mark.parametrize("cp_size", [2, 4, 8])
+def test_zigzag_rank_indices_match_relax_data_sharding(cp_size):
+    """MCore's zigzag partition must be token-for-token what Relax's data path
+    produces.
+
+    If these ever disagree, chunkwise CP would silently permute tokens relative
+    to the all-gather fallback and the attention layers.
+    """
+    lengths = [2 * cp_size * f for f in (1, 3, 2)]
+    cu = _cu(lengths)
+    full = _tagged_tokens(int(cu[-1])).reshape(-1, 1, 3)  # [s, b=1, C]
+
+    for rank in range(cp_size):
+        mcore_idx = cpl.get_thd_context_parallel_rank_indices(cu, cp_size, rank, "zigzag")
+        mcore_shard = full[mcore_idx]
+
+        # Relax data.py: per-sample slice_with_cp then concat.
+        relax_shard = torch.cat(
+            [
+                slice_with_cp(
+                    full[cu[i] : cu[i + 1]],
+                    pad_value=0.0,
+                    qkv_format="thd",
+                    dynamic_cp_size=cp_size,
+                    dynamic_cp_rank=rank,
+                )
+                for i in range(len(lengths))
+            ],
+            dim=0,
+        )
+        assert torch.equal(mcore_shard, relax_shard)
+
+        # Relax model.py (all-gather fallback) re-slices with gdn_cp_slice.
+        assert torch.equal(mcore_shard, gdn_cp_slice(full, cu, cp_size, rank))
+
+
+@pytest.mark.parametrize("cp_size", [2, 4, 8])
+@pytest.mark.parametrize("lengths_factor", [[1], [1, 2, 3], [3, 1, 1, 2]])
+def test_both_layouts_are_permutations_of_each_other(cp_size, lengths_factor):
+    """The two partitions must describe the same token set with the same per-
+    rank size.
+
+    That is the precondition for the all-to-all between them to be a pure
+    permutation -- no token invented, dropped, or duplicated. The real collective
+    round trip is asserted in ``test_gdn_cp_layout_gpu.py``.
+    """
+    lengths = [2 * cp_size * f for f in lengths_factor]
+    cu = _cu(lengths)
+    total = int(cu[-1])
+    zig_by_rank = []
+    con_by_rank = []
+    for rank in range(cp_size):
+        zig = cpl.get_thd_context_parallel_rank_indices(cu, cp_size, rank, "zigzag")
+        con = cpl.get_thd_context_parallel_rank_indices(cu, cp_size, rank, "contiguous")
+        zig_by_rank.append(zig)
+        con_by_rank.append(con)
+        assert zig.numel() == con.numel() == total // cp_size
+        # contiguous is exactly this rank's span of the flattened buffer
+        assert torch.equal(con, torch.arange(rank * (total // cp_size), (rank + 1) * (total // cp_size)))
+
+    # Across the whole CP group, both layouts are permutations of exactly the
+    # same global token rows.
+    assert torch.equal(
+        torch.cat(zig_by_rank).sort().values,
+        torch.cat(con_by_rank).sort().values,
+    )
+
+
+@pytest.mark.parametrize("cp_size", [2, 4])
+def test_rank_indices_reject_lengths_not_divisible_by_two_cp(cp_size):
+    bad = _cu([2 * cp_size, 2 * cp_size + 1])
+    with pytest.raises(ValueError, match="divisible by"):
+        cpl.get_thd_context_parallel_rank_indices(bad, cp_size, 0, "zigzag")
+
+
+def test_gdn_rejects_packed_lengths_not_divisible_by_cp():
+    from megatron.core.ssm.gated_delta_net import GatedDeltaNet
+
+    cu = _cu([8, 6])
+    with pytest.raises(ValueError, match="divisible by cp_size=4"):
+        GatedDeltaNet._resolve_cu_seqlens(None, None, cu, int(cu[-1]), "cu_seqlens_q", cp_size=4)
+
+
+def test_rank_indices_reject_unknown_layout():
+    with pytest.raises(ValueError, match="Unsupported context-parallel layout"):
+        cpl.get_thd_context_parallel_rank_indices(_cu([16, 16]), 2, 0, "contiguous_ish")
+
+
+@pytest.mark.parametrize("layout", ["zigzag", "contiguous"])
+def test_rank_indices_ignore_duplicate_boundaries(layout):
+    compact = torch.tensor([0, 16, 40], dtype=torch.int64)
+    padded = torch.tensor([0, 16, 40, 40, 40], dtype=torch.int64)
+    for rank in range(2):
+        assert torch.equal(
+            cpl.get_thd_context_parallel_rank_indices(compact, 2, rank, layout),
+            cpl.get_thd_context_parallel_rank_indices(padded, 2, rank, layout),
+        )
+
+
+@pytest.mark.parametrize("layout", ["zigzag", "contiguous"])
+def test_rank_indices_reject_decreasing_boundaries(layout):
+    with pytest.raises(ValueError, match="nondecreasing"):
+        cpl.get_thd_context_parallel_rank_indices(torch.tensor([0, 16, 8]), 2, 0, layout)
 
 
 def _packed_seq_params(cu: torch.Tensor) -> PackedSeqParams:
