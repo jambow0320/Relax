@@ -130,15 +130,7 @@ def _install_fake_megatron(monkeypatch, provider=None):
 
 def _load_model_provider(monkeypatch, provider=None):
     provider = _install_fake_megatron(monkeypatch, provider=provider)
-    package = importlib.import_module("relax.backends.megatron")
-    # Both real modules bind fake dependencies. Restore their cache entries and
-    # package attributes after the test, including when initially absent.
-    for name in ("arguments", "model_provider"):
-        fullname = f"{package.__name__}.{name}"
-        monkeypatch.setitem(sys.modules, fullname, None)
-        monkeypatch.delitem(sys.modules, fullname)
-        monkeypatch.setattr(package, name, None, raising=False)
-        monkeypatch.delattr(package, name)
+    sys.modules.pop("relax.backends.megatron.model_provider", None)
     module = importlib.import_module("relax.backends.megatron.model_provider")
     monkeypatch.setattr(module.dist, "is_initialized", lambda: True)
     monkeypatch.setattr(module.dist, "get_rank", lambda: 1)
