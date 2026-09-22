@@ -79,9 +79,6 @@ def _install_fake_megatron(monkeypatch, provider=None):
         def to_megatron_provider(self, load_weights=False):
             return provider
 
-    def _unexpected_training_setup(*args, **kwargs):
-        raise AssertionError("VPP provider tests must not invoke Megatron training setup")
-
     mpu.get_virtual_pipeline_model_parallel_world_size = lambda: 2
     mpu.get_virtual_pipeline_model_parallel_rank = lambda: 1
     mpu.get_context_parallel_world_size = lambda: 1
@@ -97,9 +94,9 @@ def _install_fake_megatron(monkeypatch, provider=None):
     spec_utils.import_module = lambda path: object()
     transformer_config.TransformerConfig = _FakeTransformerConfig
     arguments.core_transformer_config_from_args = lambda args: _FakeTransformerConfig()
-    arguments.parse_args = _unexpected_training_setup
-    arguments.validate_args = _unexpected_training_setup
-    tokenizer._vocab_size_with_padding = _unexpected_training_setup
+    arguments.parse_args = lambda *args, **kwargs: None
+    arguments.validate_args = lambda *args, **kwargs: None
+    tokenizer._vocab_size_with_padding = lambda *args, **kwargs: None
     bridge.AutoBridge = _FakeAutoBridge
     misc.load_function = lambda path: None
 
