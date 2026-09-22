@@ -419,7 +419,7 @@ def setup_model_and_optimizer(
             or torch.distributed.get_rank(group=torch.distributed.group.WORLD) == 0
         ):
             logger.info(
-                f"[GDN CP] role={role} linear_cp_mode={model_config.linear_cp_mode} "
+                f"[GDN CP] role={role} linear_cp_mode={getattr(model_config, 'linear_cp_mode', None)} "
                 f"TP={model_config.tensor_model_parallel_size} max_CP={model_config.context_parallel_size} "
                 f"key_heads={model_config.linear_num_key_heads} value_heads={model_config.linear_num_value_heads}"
             )
