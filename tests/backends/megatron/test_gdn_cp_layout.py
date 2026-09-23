@@ -3,7 +3,7 @@
 
 Checks token ownership, agreement with Relax's sharding, route equivalence, and
 cache reuse/invalidation. Real NCCL layout communication is covered in
-``test_gdn_cp_layout_gpu.py``.
+``test_gdn_cp_gpu.py``.
 """
 
 from __future__ import annotations
@@ -103,7 +103,7 @@ def test_both_layouts_are_permutations_of_each_other(cp_size, lengths_factor):
 
     That is the precondition for the all-to-all between them to be a pure
     permutation -- no token invented, dropped, or duplicated. The real collective
-    round trip is asserted in ``test_gdn_cp_layout_gpu.py``.
+    round trip is asserted in ``test_gdn_cp_gpu.py``.
     """
     lengths = [2 * cp_size * f for f in lengths_factor]
     cu = _cu(lengths)

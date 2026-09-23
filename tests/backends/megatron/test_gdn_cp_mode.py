@@ -4,7 +4,7 @@
 Covers the CLI, construction-time mode constraints, packing validation, dynamic
 CP group selection, and Relax's all-gather fallback guards. Uses fakes and
 spies for dispatch; real layout communication is covered in
-``test_gdn_cp_layout_gpu.py``.
+``test_gdn_cp_gpu.py``.
 """
 
 from __future__ import annotations
@@ -147,7 +147,7 @@ def _fake_gdn_module(*, linear_cp_mode, static_cp_size=1, deterministic_mode=Fal
 def _isolate_gdn_forward_patch():
     """`_patch_gdn_for_dynamic_cp` idempotently monkey-patches the *shared*
     GatedDeltaNet class attribute; save/restore it around every test so it
-    cannot leak into test_gdn_cp_layout_gpu.py."""
+    cannot leak into test_gdn_cp_gpu.py."""
     orig_forward = GatedDeltaNet.forward
     orig_patched_flag = getattr(GatedDeltaNet, "_dcp_patched", False)
     yield
